@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.sparsity.factory import get_sparse_coordinator
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -860,6 +861,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        # Sparse attention coordinator: construct/update representations after prefill
+        sparse_coord = get_sparse_coordinator()
+        if sparse_coord is not None:
+            sparse_coord.attention_end(o, layer, forward_batch)
+
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
@@ -897,6 +903,11 @@ class FlashInferAttnBackend(AttentionBackend):
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
+
+        # Sparse attention coordinator: update representations after decode
+        sparse_coord = get_sparse_coordinator()
+        if sparse_coord is not None and forward_batch.forward_mode.is_decode():
+            sparse_coord.attention_end(o, layer, forward_batch)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

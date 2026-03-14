@@ -14,6 +14,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.mem_cache.sparsity.factory import get_sparse_coordinator
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
 
@@ -1070,6 +1071,11 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     o = result
 
+        # Sparse attention coordinator: construct/update representations after prefill
+        sparse_coord = get_sparse_coordinator()
+        if sparse_coord is not None:
+            sparse_coord.attention_end(o, layer, forward_batch)
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -1107,6 +1113,16 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
+
+        # Sparse attention coordinator: select important KV pages before attention
+        sparse_coord = get_sparse_coordinator()
+        if sparse_coord is not None and forward_batch.forward_mode.is_decode():
+            modified_metadata = sparse_coord.attention_begin(
+                q, k, v, layer, forward_batch, metadata
+            )
+            if modified_metadata is not None:
+                metadata = modified_metadata
+
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
             self.has_local_attention
@@ -1352,6 +1368,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 o = result
+
+        # Sparse attention coordinator: update representations after attention
+        if sparse_coord is not None and forward_batch.forward_mode.is_decode():
+            sparse_coord.attention_end(o, layer, forward_batch)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
