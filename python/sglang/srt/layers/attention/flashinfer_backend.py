@@ -904,9 +904,19 @@ class FlashInferAttnBackend(AttentionBackend):
             v_scale=layer.v_scale_float,
         )
 
-        # Sparse attention coordinator: update representations after decode
+        # Sparse attention coordinator: update representations after decode.
+        # WARNING: FlashInfer does not support attention_begin (page table rewriting
+        # via FlashAttentionAdaptor), so sparse page selection is NOT applied.
+        # Only attention_end is called for representation construction/update.
         sparse_coord = get_sparse_coordinator()
         if sparse_coord is not None and forward_batch.forward_mode.is_decode():
+            if layer.layer_id == 0:
+                logger.warning_once(
+                    "SparseCoordinator is active but FlashInfer backend does not "
+                    "support attention_begin (page table rewriting). Sparse page "
+                    "selection is NOT applied during decode. Use "
+                    "--attention-backend flashattention for sparse attention."
+                )
             sparse_coord.attention_end(o, layer, forward_batch)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
