@@ -10,19 +10,24 @@ Key design choices:
 - Scoring and accumulation are separated: _retrieve_page_scores is a pure
   read; _finalize_step_accumulation runs once per decode step at the last layer.
 - Score buffers are shared across layer groups (score_layer_group_size=4)
-  using float16 for memory efficiency.
-- DESIGN: Within each layer group, the last layer's fresh score overwrites
-  earlier layers'. This is intentional — H2O paper Fig 10 shows heavy hitter
-  patterns are highly consistent across adjacent layers. Accumulating or
-  averaging across layers within a group showed no accuracy improvement.
+  using float32. Within each layer group, the last layer's fresh score
+  overwrites earlier layers'. This is intentional — H2O paper Fig 10 shows
+  heavy hitter patterns are highly consistent across adjacent layers
+  (validated on OPT; Qwen3-VL cross-layer consistency is untested — W6).
 - Attention sinks (first N pages) and vision token pages are force-retained.
 - GQA: max-across-groups aggregation (retain if ANY query head thinks page
-  is important), then sum across KV heads for page-level score. Implemented
-  via loop over group members to avoid 5D broadcast OOM (C3 fix).
+  is important), then sum across KV heads for page-level score. Base class
+  retrieve_topk calls _retrieve_page_scores per-request (B=1), so the 5D
+  broadcast intermediate is ~33MB, acceptable on any modern GPU.
 - Full-buffer decay each step prevents stale scores on pages that temporarily
-  drop out of topk.
+  drop out of topk. Global decay over-decays inactive requests' pages (I3);
+  acceptable for browser agent workloads where batch size is typically 1.
 - Stale scores cleared on page reallocation (physical page recycling).
 - Alpha resets on new prefill (construct_representations).
+- Both fresh and accumulated scores are normalized to [0,1] before alpha
+  blending to prevent scale mismatch (W2 fix).
+- _pending_fresh accumulates across requests in a batch via torch.cat (F2 fix).
+  scatter_add_ used for deterministic accumulation with duplicate indices (W4 fix).
 """
 
 import logging
@@ -69,7 +74,9 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
         self.page_k_max = {}
         self.page_valid = {}
 
-        # H2O accumulated scores (per layer group, float16)
+        # H2O accumulated scores (per layer group, float32 — F1 fix: float16 overflows
+        # after ~10 decode steps since Quest scores sum to ~1000-9000 per step and
+        # accumulated sum reaches ~18x that, exceeding float16 max of 65504)
         self.accumulated_scores = {}
         self.num_groups = 0
 
@@ -79,7 +86,9 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
         # Vision page mask (precomputed via mark_vision_pages after prefill)
         self.vision_page_mask = None
 
-        # Pending fresh scores for deferred accumulation
+        # Pending fresh scores for deferred accumulation.
+        # F2 fix: accumulates across requests in a batch via torch.cat,
+        # not overwritten per-request.
         self._pending_fresh = {}
 
     def _initialize_representation_pools(
@@ -88,7 +97,23 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
         key_buf = self.token_to_kv_pool.get_key_buffer(start_layer)
         head_num, head_dim = key_buf.shape[1], key_buf.shape[2]
 
-        # M1: Warn if page_size=1 would require excessive memory
+        # F3 fix: Warn if CUDA graphs are enabled (incompatible with Python
+        # dict/loop/branch control flow in retrieve_topk and _finalize_step_accumulation)
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            server_args = get_global_server_args()
+            if server_args is not None and not getattr(
+                server_args, "disable_cuda_graph", True
+            ):
+                logger.warning(
+                    "H2OQuest sparse attention is incompatible with CUDA graphs. "
+                    "Use --disable-cuda-graph to avoid incorrect results."
+                )
+        except ImportError:
+            pass
+
+        # Warn if page_size=1 would require excessive memory
         if self.page_size == 1 and total_num_pages > 50000:
             logger.warning(
                 "page_size=1 with %d pages requires ~%.1f GB for bounding-box "
@@ -115,13 +140,13 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
                 total_num_pages, dtype=torch.bool, device=self.device
             )
 
-        # H2O accumulated scores (per layer GROUP, float16 for memory)
+        # H2O accumulated scores (per layer GROUP, float32 — F1 fix)
         self.num_groups = math.ceil(
             (end_layer - start_layer) / self.score_layer_group_size
         )
         for g in range(self.num_groups):
             self.accumulated_scores[g] = torch.zeros(
-                (total_num_pages,), dtype=torch.float16, device=self.device
+                (total_num_pages,), dtype=torch.float32, device=self.device
             )
 
         # Per-request decode step counter
@@ -235,7 +260,7 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
             for g in range(self.num_groups):
                 self.accumulated_scores[g][target_pages] = 0
 
-            # I1: Vision token protection requires external call to mark_vision_pages()
+            # Vision token protection requires external call to mark_vision_pages()
             # since token IDs are not available in k_buffer.
             if self.protect_vision_tokens:
                 logger.warning_once(
@@ -281,28 +306,38 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
         req_pool_indices: torch.Tensor,
         queries: torch.Tensor,
     ) -> torch.Tensor:
-        """Score pages using Quest bounding-box + H2O accumulated scores. PURE READ."""
+        """Score pages using Quest bounding-box + H2O accumulated scores.
+
+        PURE READ — no mutation of accumulated_scores buffer. Fresh scores are
+        stashed in _pending_fresh for deferred accumulation at end of step.
+        """
         # 1. Fresh Quest bounding-box score (query-aware)
         fresh_score = self._quest_bounding_box_score(
             layer_id, phys_pages, req_pool_indices, queries
         )
 
-        # 2. Read accumulated buffer (NO MUTATION)
+        # 2. Read accumulated buffer (NO MUTATION — F1 fix: now float32)
         group_id = (layer_id - self.start_layer) // self.score_layer_group_size
         phys_clamped = phys_pages.clamp(
             0, self.accumulated_scores[group_id].shape[0] - 1
         )
-        acc = self.accumulated_scores[group_id][phys_clamped].float()
+        acc = self.accumulated_scores[group_id][phys_clamped]
 
         # 3. Stash fresh score for deferred accumulation.
         # DESIGN: Within each layer group, the last layer's fresh score overwrites
-        # earlier layers'. This is intentional — H2O paper Fig 10 shows heavy hitter
-        # patterns are highly consistent across adjacent layers. Accumulating or
-        # averaging across layers within a group showed no accuracy improvement.
-        self._pending_fresh[group_id] = (phys_clamped, fresh_score.detach())
+        # earlier layers'. Cross-layer Quest scores are highly correlated (H2O
+        # paper Fig 10). Cross-layer consistency for Qwen3-VL is untested (W6).
+        # F2 fix: accumulate across requests in a batch, not overwrite.
+        if group_id not in self._pending_fresh:
+            self._pending_fresh[group_id] = (phys_clamped, fresh_score.detach())
+        else:
+            prev_pages, prev_fresh = self._pending_fresh[group_id]
+            self._pending_fresh[group_id] = (
+                torch.cat([prev_pages, phys_clamped], dim=0),
+                torch.cat([prev_fresh, fresh_score.detach()], dim=0),
+            )
 
         # 4. Inject attention sinks (vectorized, intersected with page validity)
-        # C2 fix: only inject sinks for valid pages to avoid attending garbage KV
         scores_for_blend = fresh_score.clone()
         if self.num_sink_pages > 0:
             num_pages = phys_pages.shape[1]
@@ -320,8 +355,7 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
                     scores_for_blend,
                 )
 
-        # 5. Inject vision token protection
-        # M4 fix: intersect with page validity
+        # 5. Inject vision token protection (intersected with page validity)
         if self.protect_vision_tokens:
             vision_mask = (
                 self.vision_page_mask[phys_clamped]
@@ -337,18 +371,41 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
                     scores_for_blend,
                 )
 
-        # 6. Alpha blending
-        # M3 note: alpha controls the blend weight, but accumulated scores are
-        # cumulative sums (~12.8x a single fresh score after 20 steps with
-        # decay=0.95). At alpha=0.12, the accumulated term dominates by ~100x.
-        # Ranking within each component is preserved, so topk selection is
-        # correct. For more balanced blending, normalize both components to
-        # [0,1] before mixing (future improvement).
+        # 6. Alpha blending with normalization (W2 fix)
+        # Without normalization, accumulated scores (~12.8x fresh after 20 steps)
+        # overwhelm fresh scores, making alpha meaningless. Normalizing both to
+        # [0,1] ensures alpha has its intuitive meaning: at alpha=0.5, fresh and
+        # accumulated contribute equally to the ranking.
         steps = self.decode_steps[req_pool_indices].float()
         alpha = self.initial_alpha * (self.alpha_decay**steps)
-        scores = alpha.unsqueeze(1) * scores_for_blend + (
+
+        # Normalize fresh scores to [0,1] (exclude -inf from invalid/sink pages)
+        valid_fresh = torch.where(
+            scores_for_blend < torch.finfo(scores_for_blend.dtype).max * 0.5,
+            scores_for_blend,
+            torch.zeros_like(scores_for_blend),
+        )
+        fresh_max = valid_fresh.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
+        fresh_min = valid_fresh.min(dim=-1, keepdim=True).values
+        fresh_range = (fresh_max - fresh_min).clamp(min=1e-8)
+        fresh_normalized = (scores_for_blend - fresh_min) / fresh_range
+
+        # Normalize accumulated scores to [0,1]
+        valid_acc = torch.where(acc > float("-inf"), acc, torch.zeros_like(acc))
+        acc_max = valid_acc.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
+        acc_min = valid_acc.min(dim=-1, keepdim=True).values
+        acc_range = (acc_max - acc_min).clamp(min=1e-8)
+        acc_normalized = (acc - acc_min) / acc_range
+
+        # Re-inject float_max for sinks/vision (normalization may have changed them)
+        if self.num_sink_pages > 0 or self.protect_vision_tokens:
+            force_retain = scores_for_blend >= torch.finfo(scores_for_blend.dtype).max * 0.5
+            fresh_normalized = torch.where(force_retain, torch.ones_like(fresh_normalized), fresh_normalized)
+            acc_normalized = torch.where(force_retain, torch.ones_like(acc_normalized), acc_normalized)
+
+        scores = alpha.unsqueeze(1) * fresh_normalized + (
             1 - alpha.unsqueeze(1)
-        ) * acc
+        ) * acc_normalized
 
         return scores
 
@@ -361,9 +418,10 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
     ) -> torch.Tensor:
         """Compute Quest-style bounding-box criticality with GQA max-aggregation.
 
-        C3 fix: Uses loop over GQA group members instead of 5D broadcast to
-        reduce peak intermediate from ~268MB to ~67MB (B=8, P=2048).
-        I2 fix: Explicit dtype cast in GQA branch.
+        Base class retrieve_topk calls this per-request (B=1 always), so the 5D
+        broadcast intermediate is ~33MB for P=2048, kv=8, group=4, dim=128.
+        Acceptable on any modern GPU. Loop kept for clarity and future-proofing
+        if the base class is ever batched (W1).
         """
         phys_pages_clamped = phys_pages.clamp(
             0, self.page_k_min[layer_id].shape[0] - 1
@@ -401,9 +459,9 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
                 )
             group = q_heads // kv_heads
 
-            # C3 fix: Loop over GQA group members instead of 5D broadcast.
-            # Each iteration uses only a [B, P, kv_heads, dim] intermediate.
-            # I2 fix: Explicit dtype cast to k_min.dtype.
+            # GQA max-across-groups: loop over group members. B=1 at call site
+            # (base class retrieve_topk iterates per-request), so peak intermediate
+            # per iteration is 1 × P × kv_heads × dim × 4 bytes ≈ 8MB for P=2048.
             q_grouped = q.to(k_min.dtype).view(
                 q.shape[0], kv_heads, group, head_dim
             )
@@ -453,7 +511,8 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
         if layer_id == self.start_layer:
             self._pending_fresh.clear()
 
-        # Call parent's retrieve_topk (calls _retrieve_page_scores, handles topk + recent)
+        # Call parent's retrieve_topk (calls _retrieve_page_scores per-request
+        # in a Python loop with B=1, handles topk + recent page selection)
         selected, lengths = super().retrieve_topk(
             queries, layer_id, req_pool_indices, sparse_mask, **kwargs
         )
@@ -467,21 +526,25 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
     def _finalize_step_accumulation(self, req_pool_indices: torch.Tensor):
         """Apply decay to ALL pages + add fresh scores. Called once per decode step.
 
-        I3 note: Global decay affects all pages including those belonging to
-        other requests not in the current batch. For single-request or low-batch
-        browser agent workloads this is negligible. For high-throughput
-        multi-batch serving, pages of intermittently-batched requests may be
-        over-decayed. The stale-score clearing on page reallocation prevents
-        incorrect scores; the worst case is slightly faster effective decay.
-        V2 improvement: only decay current batch pages.
+        Global decay affects all pages including those belonging to other requests
+        not in the current batch. For single-request or low-batch browser agent
+        workloads this is negligible. For high-throughput multi-batch serving,
+        pages of intermittently-batched requests may be over-decayed. The
+        stale-score clearing on page reallocation prevents incorrect scores;
+        the worst case is slightly faster effective decay (I3).
         """
         for g in range(self.num_groups):
             # Decay ALL pages globally (not just selected — prevents stale high
             # scores on pages that temporarily drop out of topk)
             self.accumulated_scores[g] *= self.score_decay
-            # Add fresh scores only for pages scored this step
+            # Add fresh scores only for pages scored this step.
+            # F2 fix: _pending_fresh now accumulates across requests in batch.
+            # W4 fix: scatter_add_ is deterministic for duplicate indices,
+            # unlike __iadd__ with advanced indexing on CUDA.
             if g in self._pending_fresh:
                 phys_clamped, fresh = self._pending_fresh[g]
-                self.accumulated_scores[g][phys_clamped] += fresh.to(torch.float16)
+                self.accumulated_scores[g].scatter_add_(
+                    0, phys_clamped.view(-1).long(), fresh.view(-1)
+                )
         self._pending_fresh.clear()
         self.decode_steps[req_pool_indices] += 1
