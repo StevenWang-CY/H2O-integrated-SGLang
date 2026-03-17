@@ -1447,5 +1447,263 @@ class TestQuestVsH2OQuestComparative(unittest.TestCase):
         )
 
 
+# ============================================================================
+# TestBugFixes — Regression tests for BUGs 2, 4, 6
+# ============================================================================
+
+
+class TestBugFixes(unittest.TestCase):
+    """Regression tests for audit-identified bugs."""
+
+    def test_bug4_pending_fresh_different_page_counts(self):
+        """BUG 4: _pending_fresh should handle variable page counts across requests.
+
+        When batch_size > 1 and requests have different sequence lengths, the
+        per-request phys_clamped tensors have different shapes [1, P_i]. The old
+        code used torch.cat(..., dim=0) on 2D tensors which would fail on shape
+        mismatch. The fix flattens to 1D before concatenating.
+        """
+        # Two requests with different seq_lens → different page counts
+        total_tokens = 2048
+        page_size = PAGE_SIZE
+        seq_lens = [1024, 512]  # 64 pages vs 32 pages
+        num_requests = 2
+
+        algo, k_buf, rtp, states, cfg = create_algorithm_with_mocks(
+            H2OQuestAlgorithm,
+            sparse_extra_config={"score_decay": 0.95, "score_layer_group_size": 4},
+            total_tokens=total_tokens,
+            page_size=page_size,
+            num_requests=num_requests,
+            seq_lens=seq_lens,
+        )
+
+        req_indices = torch.tensor([0, 1], device=DEVICE, dtype=torch.int64)
+        seq_lens_t = torch.tensor(seq_lens, device=DEVICE, dtype=torch.int64)
+
+        # Construct representations (prefill)
+        run_construct(algo, k_buf, req_indices, seq_lens_t)
+
+        # Run retrieve_topk — this calls _retrieve_page_scores per-request
+        # in a loop, accumulating into _pending_fresh. With the bug, torch.cat
+        # would fail because request 0 has 64 pages and request 1 has 32 pages.
+        queries = torch.randn(2, Q_HEADS * HEAD_DIM, device=DEVICE)
+        try:
+            run_retrieve_topk(algo, queries, req_indices, seq_lens_t)
+        except RuntimeError as e:
+            self.fail(
+                f"BUG 4 regression: _pending_fresh torch.cat failed with "
+                f"different page counts: {e}"
+            )
+
+        # Verify accumulated scores were updated for both requests' pages
+        for g in range(algo.num_groups):
+            self.assertTrue(
+                (algo.accumulated_scores[g] > 0).any(),
+                f"Group {g} accumulated scores should have non-zero entries "
+                f"after one decode step",
+            )
+
+    def test_bug6_prompt_lens_set_after_construct(self):
+        """BUG 6: prompt_lens must be set during construct_representations.
+
+        Without this fix, prompt_lens stays 0 and _compute_sparse_mask always
+        returns False, making the entire sparse decode path a no-op.
+        """
+        total_tokens = 4096
+        seq_len = 4096  # > min_sparse_prompt_len (default 2048)
+
+        algo, k_buf, rtp, states, cfg = create_algorithm_with_mocks(
+            H2OQuestAlgorithm,
+            sparse_extra_config={"score_decay": 0.95},
+            total_tokens=total_tokens,
+            seq_lens=[seq_len],
+        )
+
+        req_indices = torch.tensor([0], device=DEVICE, dtype=torch.int64)
+        seq_lens_t = torch.tensor([seq_len], device=DEVICE, dtype=torch.int64)
+
+        # Before construct: prompt_lens should be 0 (unset)
+        self.assertEqual(
+            states.prompt_lens[0].item(), 0, "prompt_lens should start at 0"
+        )
+
+        # Run construct (prefill)
+        run_construct(algo, k_buf, req_indices, seq_lens_t)
+
+        # After construct: prompt_lens should be set to seq_len
+        self.assertEqual(
+            states.prompt_lens[0].item(),
+            seq_len,
+            f"prompt_lens should be {seq_len} after construct, got "
+            f"{states.prompt_lens[0].item()}",
+        )
+
+        # Verify _compute_sparse_mask would now return True
+        from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
+            SparseConfig,
+        )
+
+        min_sparse = cfg.min_sparse_prompt_len
+        mask = states.prompt_lens[req_indices] >= min_sparse
+        self.assertTrue(
+            mask.all(),
+            f"Sparse mask should be True for prompt_len={seq_len} >= "
+            f"min_sparse_prompt_len={min_sparse}",
+        )
+
+    def test_bug2_mark_vision_pages_from_batch(self):
+        """BUG 2: _mark_vision_pages_from_batch should mark vision token pages.
+
+        Vision token protection was configured but mark_vision_pages was never
+        called. The fix calls _mark_vision_pages_from_batch from
+        construct_representations, which uses ForwardBatch.input_ids.
+        """
+        total_tokens = 1024
+        page_size = PAGE_SIZE
+        seq_len = total_tokens
+        image_token_id = 151655
+        video_token_id = 151656
+
+        algo, k_buf, rtp, states, cfg = create_algorithm_with_mocks(
+            H2OQuestAlgorithm,
+            sparse_extra_config={
+                "protect_vision_tokens": True,
+                "image_token_id": image_token_id,
+                "video_token_id": video_token_id,
+                "score_decay": 0.95,
+            },
+            total_tokens=total_tokens,
+            page_size=page_size,
+            seq_lens=[seq_len],
+        )
+
+        req_indices = torch.tensor([0], device=DEVICE, dtype=torch.int64)
+        seq_lens_t = torch.tensor([seq_len], device=DEVICE, dtype=torch.int64)
+
+        # Create token_ids with vision tokens at known positions
+        token_ids = torch.zeros(seq_len, device=DEVICE, dtype=torch.long)
+        # Place image tokens at positions 32-47 (page 2 for page_size=16)
+        token_ids[32:48] = image_token_id
+        # Place video tokens at positions 64-79 (page 4)
+        token_ids[64:80] = video_token_id
+
+        # Build a MockForwardBatch with extend fields
+        fb = MockForwardBatch(
+            _MockForwardMode.EXTEND,
+            seq_lens_t,
+            req_pool_indices=req_indices,
+        )
+        fb.input_ids = token_ids
+        fb.extend_start_loc = torch.tensor([0], device=DEVICE, dtype=torch.int64)
+        fb.extend_seq_lens = torch.tensor([seq_len], device=DEVICE, dtype=torch.int64)
+
+        # Run construct_representations (triggers _mark_vision_pages_from_batch)
+        for layer_id in range(START_LAYER, START_LAYER + NUM_LAYERS):
+            algo.construct_representations(
+                layer_id=layer_id,
+                req_pool_indices=req_indices,
+                seq_lens=seq_lens_t,
+                k_buffer=k_buf[layer_id],
+                forward_batch=fb,
+            )
+
+        # Verify vision pages are marked
+        # With identity mapping: token 32 → physical token 32 → page 32//16 = 2
+        # Token 64 → page 64//16 = 4
+        expected_vision_pages = set()
+        for pos in range(32, 48):
+            expected_vision_pages.add(pos // page_size)
+        for pos in range(64, 80):
+            expected_vision_pages.add(pos // page_size)
+
+        for page_id in expected_vision_pages:
+            self.assertTrue(
+                algo.vision_page_mask[page_id].item(),
+                f"Page {page_id} should be marked as vision page",
+            )
+
+        # Verify non-vision pages are NOT marked
+        for page_id in [0, 1, 6, 7]:
+            self.assertFalse(
+                algo.vision_page_mask[page_id].item(),
+                f"Page {page_id} should NOT be marked as vision page",
+            )
+
+    def test_bug2_mark_vision_pages_prefix_cache(self):
+        """BUG 2 prefix-cache regression: vision positions must use absolute offsets.
+
+        When prefix caching is active, extend_seq_lens < seq_lens. The extend
+        tokens are a suffix of the full sequence, so positions within the extend
+        slice are relative (0-indexed). But req_to_token uses absolute positions.
+        The fix adds position_offset = total_seq - extend_len.
+        """
+        total_tokens = 2048
+        page_size = PAGE_SIZE
+        seq_len = 2048  # Full sequence length
+        prefix_len = 1024  # First 1024 tokens are prefix-cached
+        extend_len = seq_len - prefix_len  # 1024 tokens in extend
+        image_token_id = 151655
+
+        algo, k_buf, rtp, states, cfg = create_algorithm_with_mocks(
+            H2OQuestAlgorithm,
+            sparse_extra_config={
+                "protect_vision_tokens": True,
+                "image_token_id": image_token_id,
+                "video_token_id": 151656,
+                "score_decay": 0.95,
+            },
+            total_tokens=total_tokens,
+            page_size=page_size,
+            seq_lens=[seq_len],
+        )
+
+        req_indices = torch.tensor([0], device=DEVICE, dtype=torch.int64)
+        seq_lens_t = torch.tensor([seq_len], device=DEVICE, dtype=torch.int64)
+
+        # The extend slice contains tokens for positions [prefix_len, seq_len).
+        # Place image tokens at relative positions 0-15 in the extend,
+        # which are absolute positions [1024, 1040) → page 1024//16 = 64.
+        extend_token_ids = torch.zeros(extend_len, device=DEVICE, dtype=torch.long)
+        extend_token_ids[0:16] = image_token_id  # relative pos 0-15
+
+        fb = MockForwardBatch(
+            _MockForwardMode.EXTEND,
+            seq_lens_t,
+            req_pool_indices=req_indices,
+        )
+        fb.input_ids = extend_token_ids
+        fb.extend_start_loc = torch.tensor([0], device=DEVICE, dtype=torch.int64)
+        fb.extend_seq_lens = torch.tensor([extend_len], device=DEVICE, dtype=torch.int64)
+
+        for layer_id in range(START_LAYER, START_LAYER + NUM_LAYERS):
+            algo.construct_representations(
+                layer_id=layer_id,
+                req_pool_indices=req_indices,
+                seq_lens=seq_lens_t,
+                k_buffer=k_buf[layer_id],
+                forward_batch=fb,
+            )
+
+        # With prefix_len=1024, the image tokens at extend-relative pos 0-15
+        # are at absolute positions 1024-1039. With identity mapping and
+        # page_size=16: page = 1024//16 = 64, 1039//16 = 64. So page 64 only.
+        expected_page = prefix_len // page_size  # 64
+        self.assertTrue(
+            algo.vision_page_mask[expected_page].item(),
+            f"Page {expected_page} (absolute pos {prefix_len}) should be marked "
+            f"as vision page with prefix_len={prefix_len}",
+        )
+
+        # Without the prefix offset fix, positions 0-15 would map to page 0
+        # (absolute pos 0-15), which should NOT be marked
+        wrong_page = 0
+        self.assertFalse(
+            algo.vision_page_mask[wrong_page].item(),
+            f"Page {wrong_page} should NOT be marked — that would indicate "
+            f"the prefix offset was not applied",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

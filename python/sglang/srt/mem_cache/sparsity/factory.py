@@ -70,6 +70,12 @@ def _create_backend_adaptor(
 
 def _parse_sparse_config(server_args) -> SparseConfig:
     """Parse hierarchical sparse config"""
+    # Defaults (used when extra_config_str is None or JSON parse fails)
+    algorithm = "quest"
+    backend = "flashattention"
+    min_sparse_prompt_len = 2048
+    sparse_extra_config = {}
+
     # Parse extra config if provided
     extra_config_str = server_args.hierarchical_sparse_attention_extra_config
     if extra_config_str is not None:

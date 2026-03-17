@@ -74,14 +74,15 @@ def build_server_cmd(args, algorithm, sparsity_ratio):
         "--attention-backend", "fa3",
         "--disable-cuda-graph",
         "--page-size", "16",
-        "--mem-fraction-static", "0.45",
+        "--quantization", "fp8",
+        "--mem-fraction-static", "0.5",
         "--tp", str(args.tp),
     ]
 
     if algorithm != "dense":
         sparse_config = {
             "algorithm": algorithm,
-            "backend": "flashinfer",
+            "backend": "flashattention",
             "min_sparse_prompt_len": 2048,
             "sparsity_ratio": sparsity_ratio,
             "num_recent_pages": 32,
@@ -134,7 +135,7 @@ def verify_server_log(log_path, algorithm):
         if "FlashInfer backend does not support attention_begin" in content:
             print(f"  [FATAL] Sparse page selection NOT active for {algorithm}!")
             print(f"  The FlashInfer backend was used instead of fa3.")
-            print(f"  Fix: ensure --attention-backend fa3 and 'backend': 'fa3' in JSON.")
+            print(f"  Fix: ensure --attention-backend fa3 and 'backend': 'flashattention' in JSON.")
             return False
         if "ValueError" in content and "Unknown attention backend" in content:
             print(f"  [FATAL] Invalid backend in sparse config JSON.")

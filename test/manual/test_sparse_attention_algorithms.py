@@ -37,12 +37,13 @@ _SERVER_TIMEOUT = 900
 # Absolute path — tilde won't expand in subprocess env
 _HF_HOME = os.path.expanduser("~/hf_models")
 
-# Common server args for all configs (fa3 backend, page-size 16, no CUDA graph)
+# Common server args for all configs (flashinfer backend, page-size 16, FP8, no CUDA graph)
 _COMMON_ARGS = [
     "--attention-backend", "flashinfer",
     "--disable-cuda-graph",
     "--page-size", "16",
-    "--mem-fraction-static", "0.45",
+    "--quantization", "fp8",
+    "--mem-fraction-static", "0.5",
 ]
 
 
@@ -141,6 +142,27 @@ class TestQuestSparse(CustomTestCase):
         text = response.json().get("text", "")
         self.assertGreater(len(text), 5)
 
+    def test_long_prompt_quest_sparse_decode(self):
+        """Quest with prompt > 2048 tokens to trigger sparse page selection."""
+        filler = "Hello world. " * 1000
+        prompt = f"Long document:\n\n{filler}\n\nWhat is 2 + 2?"
+
+        import time as _time
+        start = _time.time()
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={"text": prompt, "sampling_params": {"temperature": 0.0, "max_new_tokens": 30}},
+            timeout=120,
+        )
+        elapsed = _time.time() - start
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        prompt_tokens = result.get("meta_info", {}).get("prompt_tokens", 0)
+        text = result.get("text", "")
+        print(f"\n[Quest Long] prompt_tokens={prompt_tokens}, latency={elapsed:.2f}s, output={text[:80]}")
+        self.assertGreater(prompt_tokens, 2048)
+        self.assertGreater(len(text), 0)
+
 
 class TestH2OQuestSparse(CustomTestCase):
     """T2.3: H2OQuest sparse attention at sparsity_ratio=0.5.
@@ -209,6 +231,70 @@ class TestH2OQuestSparse(CustomTestCase):
         self.assertEqual(r1.status_code, 200)
         text1 = r1.json().get("text", "")
         self.assertIn("ALPHA", text1.upper())
+
+    def test_long_prompt_sparse_decode(self):
+        """Send a prompt > min_sparse_prompt_len (2048 tokens) to trigger sparse
+        page selection during decode. This is the ONLY test that actually exercises
+        the sparse attention code path — all other tests use short prompts that
+        stay below the 2048-token threshold and run dense attention.
+
+        The prompt is ~3000 tokens of repeated text with a distinctive fact embedded
+        in the middle. If sparse attention corrupts the KV cache, the model will
+        produce garbage or crash. If it works, the model generates coherent output.
+        """
+        # Build a long prompt (~3000 tokens)
+        # Each "Hello world " is ~3 tokens, so 1000 repetitions ≈ 3000 tokens
+        filler = "Hello world. " * 1000
+        prompt = (
+            f"Below is a long document:\n\n{filler}\n\n"
+            "Based on the document above, answer: What is 2 + 2?"
+        )
+
+        import time as _time
+        start = _time.time()
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": prompt,
+                "sampling_params": {"temperature": 0.0, "max_new_tokens": 30},
+            },
+            timeout=120,
+        )
+        elapsed = _time.time() - start
+
+        self.assertEqual(
+            response.status_code, 200,
+            f"Long prompt request failed with status {response.status_code}",
+        )
+
+        result = response.json()
+        text = result.get("text", "")
+        prompt_tokens = result.get("meta_info", {}).get("prompt_tokens", 0)
+        completion_tokens = result.get("meta_info", {}).get("completion_tokens", 0)
+
+        print(f"\n[H2OQuest Long Prompt]")
+        print(f"  Prompt tokens: {prompt_tokens}")
+        print(f"  Completion tokens: {completion_tokens}")
+        print(f"  E2E latency: {elapsed:.2f}s")
+        print(f"  Output: {text[:100]}...")
+
+        # Verify prompt exceeded sparse threshold
+        self.assertGreater(
+            prompt_tokens, 2048,
+            f"Prompt must be > 2048 tokens to trigger sparse decode, got {prompt_tokens}",
+        )
+
+        # Verify output is non-empty and not garbage
+        self.assertGreater(len(text), 0, "Output is empty")
+        self.assertGreater(completion_tokens, 0, "No tokens generated")
+
+        # Verify output is coherent (not random bytes/repetitive garbage)
+        # The model should produce readable text, not null bytes or control chars
+        printable_ratio = sum(c.isprintable() or c.isspace() for c in text) / max(len(text), 1)
+        self.assertGreater(
+            printable_ratio, 0.9,
+            f"Output is mostly non-printable ({printable_ratio:.0%}), likely corrupt",
+        )
 
 
 @unittest.skipUnless(

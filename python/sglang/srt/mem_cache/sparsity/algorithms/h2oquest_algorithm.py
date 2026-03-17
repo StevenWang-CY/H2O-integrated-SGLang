@@ -178,9 +178,19 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
     def construct_representations(
         self, layer_id, req_pool_indices, seq_lens, k_buffer, forward_batch
     ):
-        """Override to reset decode steps on new prefill (alpha reset)."""
+        """Override to reset decode steps, set prompt_lens, and mark vision pages."""
         if layer_id == self.start_layer:
             self.decode_steps[req_pool_indices] = 0
+            # Set prompt_lens for new requests so _compute_sparse_mask works.
+            # Without this, prompt_lens stays 0 (from RequestTrackers init) and
+            # sparse attention is never applied during decode.
+            new_mask = ~self.states.repr_constructed[req_pool_indices]
+            if new_mask.any():
+                self.states.prompt_lens[req_pool_indices[new_mask]] = seq_lens[
+                    new_mask
+                ]
+            # Mark vision pages from batch token IDs (first prefill only)
+            self._mark_vision_pages_from_batch(req_pool_indices, forward_batch)
         super().construct_representations(
             layer_id, req_pool_indices, seq_lens, k_buffer, forward_batch
         )
@@ -260,26 +270,67 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
             for g in range(self.num_groups):
                 self.accumulated_scores[g][target_pages] = 0
 
-            # Vision token protection requires external call to mark_vision_pages()
-            # since token IDs are not available in k_buffer.
+            # Vision token protection: mark_vision_pages is called from
+            # construct_representations via _mark_vision_pages_from_batch,
+            # which has access to token IDs from the ForwardBatch.
             if self.protect_vision_tokens:
-                logger.warning_once(
-                    "Vision token protection is enabled but token IDs are not "
-                    "available in _compute_page_representations. Vision pages "
-                    "are NOT automatically protected. Call "
-                    "algorithm.mark_vision_pages() after prefill to enable "
-                    "protection for Qwen3-VL image/video tokens."
+                logger.debug(
+                    "Vision token protection active. Pages marked via "
+                    "_mark_vision_pages_from_batch in construct_representations."
                 )
 
-    def mark_vision_pages(
-        self, req_pool_idx: int, token_ids: torch.Tensor, seq_len: int
+    def _mark_vision_pages_from_batch(
+        self, req_pool_indices: torch.Tensor, forward_batch: "ForwardBatch"
     ):
-        """Mark pages containing vision tokens. Call after prefill with token IDs.
+        """Mark vision pages using token IDs from the current extend batch.
+
+        Called at the first layer during construct_representations (prefill).
+        Uses extend_start_loc and extend_seq_lens to split the flattened
+        input_ids back into per-request token ID segments.
+        """
+        if not self.protect_vision_tokens:
+            return
+        if not hasattr(forward_batch, "extend_start_loc"):
+            return
+        if forward_batch.extend_start_loc is None:
+            return
+
+        input_ids = forward_batch.input_ids
+        extend_start_loc = forward_batch.extend_start_loc
+        extend_seq_lens = forward_batch.extend_seq_lens
+
+        for i in range(req_pool_indices.shape[0]):
+            req_idx = req_pool_indices[i].item()
+            # Only mark on first prefill (repr not yet constructed)
+            if self.states.repr_constructed[req_idx]:
+                continue
+            start = extend_start_loc[i].item()
+            length = extend_seq_lens[i].item()
+            token_ids = input_ids[start : start + length]
+            # Prefix cache offset: extend tokens start at absolute position
+            # prefix_len in the request. mark_vision_pages looks up
+            # req_to_token[req_pool_idx, pos], so positions must be absolute.
+            total_seq = forward_batch.seq_lens[i].item()
+            prefix_len = total_seq - length
+            self.mark_vision_pages(req_idx, token_ids, length, position_offset=prefix_len)
+
+    def mark_vision_pages(
+        self,
+        req_pool_idx: int,
+        token_ids: torch.Tensor,
+        seq_len: int,
+        position_offset: int = 0,
+    ):
+        """Mark pages containing vision tokens.
 
         Args:
             req_pool_idx: Request pool index.
             token_ids: Token IDs for the request (1D tensor).
             seq_len: Actual sequence length (may be less than token_ids length).
+            position_offset: Offset to add to token positions before looking up
+                req_to_token. Needed when token_ids is a slice from a prefix-cached
+                extend (positions are relative to extend start, but req_to_token
+                uses absolute request positions).
         """
         tokens = token_ids[:seq_len]
         is_vision = (tokens == self.image_token_id) | (
@@ -291,10 +342,10 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
 
         req_to_token = self.req_to_token_pool.req_to_token
         for pos in vision_positions:
-            pos_val = pos.item()
-            if pos_val >= req_to_token.shape[1]:
+            abs_pos = pos.item() + position_offset
+            if abs_pos >= req_to_token.shape[1]:
                 continue
-            phys_tok = req_to_token[req_pool_idx, pos_val]
+            phys_tok = req_to_token[req_pool_idx, abs_pos]
             phys_page = phys_tok // self.page_size
             if phys_page < self.vision_page_mask.shape[0]:
                 self.vision_page_mask[phys_page] = True
@@ -328,23 +379,49 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
         # earlier layers'. Cross-layer Quest scores are highly correlated (H2O
         # paper Fig 10). Cross-layer consistency for Qwen3-VL is untested (W6).
         # F2 fix: accumulate across requests in a batch, not overwrite.
+        # Flatten to 1D before storing — requests may have different page counts
+        # (P_i varies per request), so 2D torch.cat along dim=0 would fail on
+        # shape mismatch. The consumer (scatter_add_) uses 1D indices anyway.
         if group_id not in self._pending_fresh:
-            self._pending_fresh[group_id] = (phys_clamped, fresh_score.detach())
+            self._pending_fresh[group_id] = (
+                phys_clamped.view(-1),
+                fresh_score.detach().view(-1),
+            )
         else:
             prev_pages, prev_fresh = self._pending_fresh[group_id]
             self._pending_fresh[group_id] = (
-                torch.cat([prev_pages, phys_clamped], dim=0),
-                torch.cat([prev_fresh, fresh_score.detach()], dim=0),
+                torch.cat([prev_pages, phys_clamped.view(-1)], dim=0),
+                torch.cat([prev_fresh, fresh_score.detach().view(-1)], dim=0),
             )
 
-        # 4. Inject attention sinks (vectorized, intersected with page validity)
+        # 4. Inject attention sinks (match by physical page ID, not array position)
+        # Robust against potential reordering of phys_pages in future base class changes.
         scores_for_blend = fresh_score.clone()
         if self.num_sink_pages > 0:
             num_pages = phys_pages.shape[1]
             if num_pages > 0:
                 sink_count = min(self.num_sink_pages, num_pages)
-                sink_mask = torch.zeros_like(scores_for_blend, dtype=torch.bool)
-                sink_mask[:, :sink_count] = True
+                req_to_token = self.req_to_token_pool.req_to_token
+                # Compute physical page IDs for the first sink_count logical pages
+                sink_logical_starts = (
+                    torch.arange(sink_count, device=self.device) * self.page_size
+                )
+                sink_logical_starts = sink_logical_starts.clamp(
+                    max=req_to_token.shape[1] - 1
+                )
+                sink_phys_tok = req_to_token[
+                    req_pool_indices.unsqueeze(1),
+                    sink_logical_starts.unsqueeze(0).expand(
+                        req_pool_indices.shape[0], -1
+                    ),
+                ]
+                sink_phys_pages = sink_phys_tok // self.page_size
+                # Match: True where phys_clamped equals any sink physical page ID
+                # sink_phys_pages: [B, sink_count] -> [B, 1, sink_count]
+                # phys_clamped:    [B, P]          -> [B, P, 1]
+                sink_mask = (
+                    phys_clamped.unsqueeze(2) == sink_phys_pages.unsqueeze(1)
+                ).any(dim=2)
                 sink_mask = sink_mask & self.page_valid[layer_id][phys_clamped]
                 scores_for_blend = torch.where(
                     sink_mask,

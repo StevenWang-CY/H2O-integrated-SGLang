@@ -38,7 +38,7 @@ signal.signal(signal.SIGTERM, _signal_handler)
 # Default H2OQuest configuration
 DEFAULT_CONFIG = {
     "algorithm": "h2oquest",
-    "backend": "flashinfer",
+    "backend": "flashattention",
     "min_sparse_prompt_len": 2048,
     "sparsity_ratio": 0.5,
     "num_recent_pages": 32,
@@ -90,10 +90,11 @@ def launch_server(args, sparse_config, log_path):
         "--model-path", args.model,
         "--host", args.host,
         "--port", str(args.port),
-        "--attention-backend", "flashinfer",
+        "--attention-backend", "fa3",
         "--disable-cuda-graph",
         "--page-size", "16",
-        "--mem-fraction-static", "0.45",
+        "--quantization", "fp8",
+        "--mem-fraction-static", "0.5",
         "--tp", str(args.tp),
         "--hierarchical-sparse-attention-extra-config", json.dumps(sparse_config),
     ]
