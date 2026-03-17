@@ -877,9 +877,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        decode_wrapper = self.forward_metadata.decode_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
+        wrapper_idx = self._get_wrapper_idx(layer)
+        decode_wrapper = self.forward_metadata.decode_wrappers[wrapper_idx]
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -893,30 +892,112 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Call the wrapped function
+        # Sparse attention: page selection via re-planning the FlashInfer wrapper.
+        # The FlashInferSparseAdaptor builds sparse kv_indices/kv_indptr, and we
+        # call begin_forward() again with the sparse set before running attention.
+        sparse_coord = get_sparse_coordinator()
+        need_restore = False
+        if sparse_coord is not None and forward_batch.forward_mode.is_decode():
+            from sglang.srt.mem_cache.sparsity.backend.flashinfer_adaptor import (
+                FlashInferSparseAdaptor,
+            )
+
+            if isinstance(sparse_coord.backend_adaptor, FlashInferSparseAdaptor):
+                adaptor = sparse_coord.backend_adaptor
+
+                # Save original wrapper state for restore after attention
+                original_indptr = decode_wrapper._paged_kv_indptr_buf.clone()
+                original_indices_len = decode_wrapper._paged_kv_indptr_buf[
+                    len(forward_batch.req_pool_indices)
+                ].item()
+                original_indices = decode_wrapper._paged_kv_indices_buf[
+                    :original_indices_len
+                ].clone()
+                original_last_page_len = decode_wrapper._paged_kv_last_page_len_buf[
+                    : len(forward_batch.req_pool_indices)
+                ].clone()
+                original_plan_info = decode_wrapper._plan_info
+
+                # Call attention_begin → retrieve_topk → adapt_for_attn_metadata
+                sparse_coord.attention_begin(
+                    q, k, v, layer, forward_batch, None
+                )
+
+                # Check if the adaptor produced sparse indices
+                sparse_state = adaptor.get_pending_sparse()
+                if sparse_state is not None:
+                    need_restore = True
+                    bs = len(forward_batch.req_pool_indices)
+
+                    # Re-plan the wrapper with sparse indices
+                    sparse_indptr = sparse_state["kv_indptr"]
+                    sparse_kv_indices = sparse_state["kv_indices"]
+                    sparse_last_page_len = sparse_state["kv_last_page_len"]
+
+                    # Copy sparse data into wrapper's internal buffers
+                    decode_wrapper._paged_kv_indptr_buf[: bs + 1].copy_(sparse_indptr)
+                    n_sparse = sparse_indptr[bs].item()
+                    decode_wrapper._paged_kv_indices_buf[:n_sparse].copy_(
+                        sparse_kv_indices[:n_sparse]
+                    )
+                    decode_wrapper._paged_kv_last_page_len_buf[:bs].copy_(
+                        sparse_last_page_len[:bs]
+                    )
+
+                    # Re-plan with the sparse index set
+                    # Use the indptr on CPU for the plan call
+                    indptr_cpu = sparse_indptr.cpu()
+                    sparse_lens_cpu = (
+                        indptr_cpu[1 : bs + 1] - indptr_cpu[:bs]
+                    )
+                    sparse_lens_sum = sparse_lens_cpu.sum().item()
+
+                    updater = self.forward_metadata.indices_updater_decode
+                    updater.call_begin_forward(
+                        decode_wrapper,
+                        forward_batch.req_pool_indices,
+                        sparse_state["sparse_lens"].to(forward_batch.seq_lens.device),
+                        sparse_lens_sum,
+                        updater.kv_indptr[wrapper_idx],
+                        None,  # kv_start_idx
+                        None,  # spec_info
+                        seq_lens_cpu=None,
+                    )
+
+        # Call the wrapped function (with original or sparse plan)
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
 
-        # Sparse attention coordinator: update representations after decode.
-        # WARNING: FlashInfer does not support attention_begin (page table rewriting
-        # via FlashAttentionAdaptor), so sparse page selection is NOT applied.
-        # Only attention_end is called for representation construction/update.
-        sparse_coord = get_sparse_coordinator()
+        # Restore original wrapper state for next layer
+        if need_restore:
+            decode_wrapper._paged_kv_indptr_buf[: bs + 1].copy_(original_indptr[: bs + 1])
+            decode_wrapper._paged_kv_indices_buf[:original_indices_len].copy_(
+                original_indices
+            )
+            decode_wrapper._paged_kv_last_page_len_buf[:bs].copy_(original_last_page_len)
+            decode_wrapper._plan_info = original_plan_info
+
+            # Re-plan with original indices for next layer
+            updater = self.forward_metadata.indices_updater_decode
+            updater.call_begin_forward(
+                decode_wrapper,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens.sum().item(),
+                updater.kv_indptr[wrapper_idx],
+                None,
+                None,
+                seq_lens_cpu=None,
+            )
+
+        # Sparse attention coordinator: update representations after attention
         if sparse_coord is not None and forward_batch.forward_mode.is_decode():
-            if layer.layer_id == 0:
-                logger.warning_once(
-                    "SparseCoordinator is active but FlashInfer backend does not "
-                    "support attention_begin (page table rewriting). Sparse page "
-                    "selection is NOT applied during decode. Use "
-                    "--attention-backend flashattention for sparse attention."
-                )
             sparse_coord.attention_end(o, layer, forward_batch)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

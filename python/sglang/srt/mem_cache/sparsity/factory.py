@@ -14,6 +14,9 @@ from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     FlashAttentionAdaptor,
     NSABackendAdaptor,
 )
+from sglang.srt.mem_cache.sparsity.backend.flashinfer_adaptor import (
+    FlashInferSparseAdaptor,
+)
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
@@ -58,6 +61,9 @@ def _create_backend_adaptor(
 
     if backend in ["fa3", "flashattention"]:
         return FlashAttentionAdaptor(device)
+
+    if backend == "flashinfer":
+        return FlashInferSparseAdaptor(device)
 
     raise ValueError(f"Unknown attention backend: {backend}")
 

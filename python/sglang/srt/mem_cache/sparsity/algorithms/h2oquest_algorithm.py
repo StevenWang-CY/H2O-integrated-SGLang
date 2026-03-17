@@ -110,7 +110,7 @@ class H2OQuestAlgorithm(BaseSparseAlgorithmImpl):
                     "H2OQuest sparse attention is incompatible with CUDA graphs. "
                     "Use --disable-cuda-graph to avoid incorrect results."
                 )
-        except ImportError:
+        except (ImportError, ValueError):
             pass
 
         # Warn if page_size=1 would require excessive memory
