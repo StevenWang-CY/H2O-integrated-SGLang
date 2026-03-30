@@ -1108,9 +1108,11 @@ class TestH2OQuestScatterAdd(unittest.TestCase):
 
         group_id = 0
         self.assertIn(group_id, algo._pending_fresh)
-        # After request 0: shape is [1, 8]
+        # After request 0: 1D flattened tensor with 8 elements
+        # (the algorithm flattens to 1D via .view(-1) to handle variable page counts)
         pages_after_req0, fresh_after_req0 = algo._pending_fresh[group_id]
-        self.assertEqual(pages_after_req0.shape[0], 1)
+        self.assertEqual(pages_after_req0.dim(), 1)
+        self.assertEqual(pages_after_req0.shape[0], 8)
 
         phys_pages_1 = torch.arange(8, 16, device=DEVICE).unsqueeze(0)  # [1, 8]
         query_1 = torch.randn(1, 2, 4, device=DEVICE)
@@ -1121,10 +1123,10 @@ class TestH2OQuestScatterAdd(unittest.TestCase):
             query_1,
         )
 
-        # After request 1: shape should be [2, 8] (concatenated along dim=0)
+        # After request 1: 1D tensor with 16 elements (8 + 8 concatenated)
         pages_after_req1, fresh_after_req1 = algo._pending_fresh[group_id]
-        self.assertEqual(pages_after_req1.shape[0], 2)
-        self.assertEqual(pages_after_req1.shape[1], 8)
+        self.assertEqual(pages_after_req1.dim(), 1)
+        self.assertEqual(pages_after_req1.shape[0], 16)
 
         # Total elements doubled
         self.assertEqual(pages_after_req1.numel(), pages_after_req0.numel() * 2)
@@ -1504,11 +1506,15 @@ class TestBugFixes(unittest.TestCase):
                 f"after one decode step",
             )
 
-    def test_bug6_prompt_lens_set_after_construct(self):
-        """BUG 6: prompt_lens must be set during construct_representations.
+    def test_bug6_prompt_lens_set_during_registration(self):
+        """BUG 6 regression: prompt_lens must be set during request registration.
 
-        Without this fix, prompt_lens stays 0 and _compute_sparse_mask always
-        returns False, making the entire sparse decode path a no-op.
+        In the real server, on_request_begin() calls states.register() which sets
+        prompt_lens. This is what _compute_sparse_mask uses to decide whether to
+        apply sparse attention. If prompt_lens is 0, sparse is never triggered.
+
+        create_algorithm_with_mocks calls states.register(i, seq_len) which
+        correctly sets prompt_lens. This test verifies the registration path works.
         """
         total_tokens = 4096
         seq_len = 4096  # > min_sparse_prompt_len (default 2048)
@@ -1521,29 +1527,17 @@ class TestBugFixes(unittest.TestCase):
         )
 
         req_indices = torch.tensor([0], device=DEVICE, dtype=torch.int64)
-        seq_lens_t = torch.tensor([seq_len], device=DEVICE, dtype=torch.int64)
 
-        # Before construct: prompt_lens should be 0 (unset)
-        self.assertEqual(
-            states.prompt_lens[0].item(), 0, "prompt_lens should start at 0"
-        )
-
-        # Run construct (prefill)
-        run_construct(algo, k_buf, req_indices, seq_lens_t)
-
-        # After construct: prompt_lens should be set to seq_len
+        # After registration (done by create_algorithm_with_mocks):
+        # prompt_lens should be set to seq_len
         self.assertEqual(
             states.prompt_lens[0].item(),
             seq_len,
-            f"prompt_lens should be {seq_len} after construct, got "
+            f"prompt_lens should be {seq_len} after register(), got "
             f"{states.prompt_lens[0].item()}",
         )
 
-        # Verify _compute_sparse_mask would now return True
-        from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
-            SparseConfig,
-        )
-
+        # Verify _compute_sparse_mask returns True for long prompts
         min_sparse = cfg.min_sparse_prompt_len
         mask = states.prompt_lens[req_indices] >= min_sparse
         self.assertTrue(
@@ -1551,6 +1545,12 @@ class TestBugFixes(unittest.TestCase):
             f"Sparse mask should be True for prompt_len={seq_len} >= "
             f"min_sparse_prompt_len={min_sparse}",
         )
+
+        # Verify clearing works (simulates on_request_end)
+        states.clear(0)
+        self.assertEqual(states.prompt_lens[0].item(), 0)
+        # After clear, prompt_lens is 0 which is < seq_len (4096)
+        self.assertLess(states.prompt_lens[0].item(), seq_len)
 
     def test_bug2_mark_vision_pages_from_batch(self):
         """BUG 2: _mark_vision_pages_from_batch should mark vision token pages.
